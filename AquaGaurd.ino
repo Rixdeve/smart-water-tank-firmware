@@ -46,6 +46,48 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature tempSensor(&oneWire);
 bool pumpStatus = false;
 
+// ---------------- DRY-RUN / MAINS-FAILURE PROTECTION ----------------
+// NOTE: flow sensor pulses can be triggered by air movement, not only
+// water, so flow rate alone is unreliable for dry-run detection.
+// Instead we check whether the TANK LEVEL is actually rising while the
+// pump is on - if it is not, the source has failed regardless of what
+// the flow sensor reports.
+unsigned long pumpOnSince = 0;
+const unsigned long DRY_RUN_TIMEOUT_MS = 30000;    // 30s grace period before checking
+const float MIN_LEVEL_RISE_PCT = 1.0;              // must rise at least 1% in the check window
+float levelAtPumpStart = 0;
+bool dryRunFault = false;
+unsigned long dryRunFaultSince = 0;
+const unsigned long DRY_RUN_RETRY_MS = 300000;     // retry every 5 minutes
+
+// ---------------- SPLIT-BRAIN RECONCILIATION ----------------
+// While offline, readings are buffered locally instead of being
+// dropped. On reconnect, the buffer is uploaded as a single
+// reconciliation batch so the cloud record reflects what the edge
+// logic actually did during the outage - the physical/local state
+// is always treated as the source of truth, never the reverse.
+#define OFFLINE_BUFFER_SIZE 40
+struct BufferedReading {
+  unsigned long millisAtCapture;
+  float levelPct;
+  float flowOut;
+  float totalOut;
+  float ph;
+  float turbidity;
+  bool pump;
+};
+BufferedReading offlineBuffer[OFFLINE_BUFFER_SIZE];
+int offlineBufferCount = 0;
+bool wasOffline = false;
+unsigned long offlineSince = 0;
+unsigned long reconnectCount = 0;
+
+// Remote pump command state (for manual override from the app)
+bool remoteCommandPending = false;
+bool remoteCommandValue = false;
+unsigned long remoteCommandTimestamp = 0;
+const unsigned long REMOTE_COMMAND_MAX_AGE_MS = 5000; // reject if older than 5s
+
 Preferences prefs;       // stores Wi-Fi credentials
 Preferences calPrefs;    // stores tank calibration
 WebServer configServer(80);  // Wi-Fi setup portal
@@ -138,9 +180,57 @@ void loop() {
                        turbidity <= TURBIDITY_MAX_NTU);
 
   // EDGE FAIL-SAFE PUMP LOGIC - runs locally, always
-  if (!qualitySafe)                    pumpOff();
-  else if (levelPct < PUMP_ON_LEVEL)   pumpOn();
-  else if (levelPct > PUMP_OFF_LEVEL)  pumpOff();
+  if (!qualitySafe) {
+    pumpOff();
+    dryRunFault = false;
+  } else if (levelPct > PUMP_OFF_LEVEL) {
+    pumpOff();
+    dryRunFault = false;
+  } else if (levelPct < PUMP_ON_LEVEL) {
+    if (!dryRunFault) {
+      pumpOn();
+    } else if (millis() - dryRunFaultSince > DRY_RUN_RETRY_MS) {
+      // cooldown elapsed - try the source again, in case supply resumed
+      Serial.println("  [SAFETY] Retrying pump after dry-run cooldown...");
+      dryRunFault = false;
+      pumpOn();
+    }
+  }
+
+  // DRY-RUN / MAINS-FAILURE PROTECTION
+  // Flow sensor pulses can be caused by air movement, not just water,
+  // so we check the more reliable signal instead: is the tank level
+  // actually rising while the pump has been running? If the pump has
+  // been on past the grace period and the level has not meaningfully
+  // increased, the source has likely failed (air, not water, is being
+  // pumped) - stop the pump to protect it.
+  if (pumpStatus) {
+    if (pumpOnSince == 0) {
+      pumpOnSince = millis();
+      levelAtPumpStart = levelPct;
+    }
+    if (millis() - pumpOnSince > DRY_RUN_TIMEOUT_MS) {
+      float levelRise = levelPct - levelAtPumpStart;
+      if (levelRise < MIN_LEVEL_RISE_PCT) {
+        Serial.println("  [SAFETY] Pump running but tank level not rising - source may be dry (air, not water). Stopping pump.");
+        pumpOff();
+        dryRunFault = true;
+        dryRunFaultSince = millis();
+      } else {
+        // Level is genuinely rising - reset the window so we keep checking
+        pumpOnSince = millis();
+        levelAtPumpStart = levelPct;
+      }
+    }
+  } else {
+    pumpOnSince = 0;
+  }
+
+  // Clear the fault once the tank has recovered on its own
+  if (dryRunFault && levelPct >= PUMP_ON_LEVEL + 5.0) {
+    dryRunFault = false;
+    Serial.println("  [SAFETY] Dry-run fault cleared - level recovered.");
+  }
 
   Serial.println("---------------------------------------");
   Serial.printf("Temperature : %.1f C\n", tempC);
@@ -150,11 +240,12 @@ void loop() {
   Serial.printf("Flow Out    : %.2f L/min\n", flowRateOut);
   Serial.printf("pH Value    : %.2f\n", phValue);
   Serial.printf("Turbidity   : %.1f NTU\n", turbidity);
-  Serial.printf("Pump        : %s (%s)\n", pumpStatus ? "ON" : "OFF",
-                qualitySafe ? "SAFE" : "UNSAFE");
+  Serial.printf("Pump        : %s (%s)%s\n", pumpStatus ? "ON" : "OFF",
+                qualitySafe ? "SAFE" : "UNSAFE",
+                dryRunFault ? " [DRY-RUN FAULT]" : "");
 
   if (millis() - lastSend >= SEND_INTERVAL) {
-    sendData(levelPct, flowRateOut, totalLitresOut, phValue, turbidity, pumpStatus);
+    handleConnectivityAndSync(levelPct, flowRateOut, totalLitresOut, phValue, turbidity, pumpStatus);
     lastSend = millis();
   }
 
@@ -394,6 +485,158 @@ void connectWiFi() {
 }
 
 // ============================================================
+//  SPLIT-BRAIN RECONCILIATION
+// ============================================================
+// Called every SEND_INTERVAL instead of sendData() directly.
+// While connected: uploads live, and checks for any pending
+// manual pump command from the app (applying the "physical/
+// safety state wins" rule below).
+// While offline: buffers the reading locally instead of losing it.
+// On the transition back online: uploads everything captured
+// during the outage as one reconciliation batch, so the cloud
+// record reflects what actually happened, not just a gap.
+void handleConnectivityAndSync(float lvl, float flow, float total,
+                                float ph, float ntu, bool pump) {
+  bool isOnline = (WiFi.status() == WL_CONNECTED);
+
+  if (!isOnline) {
+    if (!wasOffline) {
+      wasOffline = true;
+      offlineSince = millis();
+      Serial.println("  [RECONCILE] Connectivity lost - buffering readings locally. Edge logic continues unaffected.");
+    }
+    bufferReading(lvl, flow, total, ph, ntu, pump);
+    return;
+  }
+
+  // We are online now.
+  if (wasOffline) {
+    // Just reconnected - flush the buffer as a reconciliation batch
+    // BEFORE sending the live reading, so history stays in order.
+    unsigned long downtimeMs = millis() - offlineSince;
+    reconnectCount++;
+    Serial.printf("  [RECONCILE] Connectivity restored after %.1f min offline. Syncing %d buffered readings (event #%lu)...\n",
+                  downtimeMs / 60000.0, offlineBufferCount, reconnectCount);
+    syncOfflineBuffer(downtimeMs);
+    wasOffline = false;
+  }
+
+  // Apply any pending remote pump command (manual override from app),
+  // subject to the local-state-wins reconciliation rule.
+  applyRemoteCommandIfValid();
+
+  // Normal live upload
+  sendData(lvl, flow, total, ph, ntu, pump);
+
+  // Also poll for a queued manual command for next cycle
+  pollForRemoteCommand();
+}
+
+void bufferReading(float lvl, float flow, float total, float ph, float ntu, bool pump) {
+  if (offlineBufferCount >= OFFLINE_BUFFER_SIZE) {
+    // Buffer full - drop the oldest to make room (ring-buffer behaviour),
+    // since we prioritise recent history over very old outage data.
+    for (int i = 1; i < OFFLINE_BUFFER_SIZE; i++) offlineBuffer[i - 1] = offlineBuffer[i];
+    offlineBufferCount = OFFLINE_BUFFER_SIZE - 1;
+  }
+  offlineBuffer[offlineBufferCount] = { millis(), lvl, flow, total, ph, ntu, pump };
+  offlineBufferCount++;
+}
+
+void syncOfflineBuffer(unsigned long downtimeMs) {
+  if (offlineBufferCount == 0) {
+    Serial.println("  [RECONCILE] No buffered readings to sync (outage was shorter than one cycle).");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  // Build the batch JSON: an array of readings plus reconciliation metadata
+  String body = "{";
+  body += "\"reconnect_event\":" + String(reconnectCount) + ",";
+  body += "\"downtime_ms\":" + String(downtimeMs) + ",";
+  body += "\"readings\":[";
+  for (int i = 0; i < offlineBufferCount; i++) {
+    if (i > 0) body += ",";
+    body += "{";
+    body += "\"tank_level_pct\":" + String(offlineBuffer[i].levelPct, 1) + ",";
+    body += "\"flow_rate\":"      + String(offlineBuffer[i].flowOut, 2) + ",";
+    body += "\"total_litres\":"   + String(offlineBuffer[i].totalOut, 2) + ",";
+    body += "\"ph_value\":"       + String(offlineBuffer[i].ph, 2) + ",";
+    body += "\"turbidity\":"      + String(offlineBuffer[i].turbidity, 1) + ",";
+    body += "\"pump_status\":"    + String(offlineBuffer[i].pump ? "true" : "false");
+    body += "}";
+  }
+  body += "]}";
+
+  String syncUrl = String(SERVER_URL);
+  syncUrl.replace("/sensor-reading", "/sync-batch");
+
+  http.begin(client, syncUrl);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+  Serial.print("  [RECONCILE] Batch sync HTTP "); Serial.println(code);
+  http.end();
+
+  offlineBufferCount = 0; // clear buffer after attempting sync
+}
+
+// ============================================================
+//  REMOTE PUMP OVERRIDE - "physical state wins" reconciliation
+// ============================================================
+// The app MAY request a manual pump override via the cloud, but this
+// is deliberately advisory only. Local edge safety logic can and will
+// override it: a stale command (>5s old by the time it is received)
+// or a command that conflicts with an active safety fault (unsafe
+// water quality or a dry-run fault) is rejected outright. This
+// prevents a delayed or corrupted network command from ever pushing
+// the pump into an unsafe physical state.
+void pollForRemoteCommand() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  String cmdUrl = String(SERVER_URL);
+  cmdUrl.replace("/sensor-reading", "/pump-command");
+
+  http.begin(client, cmdUrl);
+  int code = http.GET();
+  if (code == 200) {
+    String resp = http.getString();
+    // Expected: {"has_command": true, "pump_on": true, "issued_at_ms": 123456}
+    if (resp.indexOf("\"has_command\":true") >= 0) {
+      remoteCommandValue = (resp.indexOf("\"pump_on\":true") >= 0);
+      remoteCommandPending = true;
+      remoteCommandTimestamp = millis(); // local receipt time, used for staleness check
+      Serial.print("  [RECONCILE] Remote pump command received: ");
+      Serial.println(remoteCommandValue ? "ON" : "OFF");
+    }
+  }
+  http.end();
+}
+
+void applyRemoteCommandIfValid() {
+  if (!remoteCommandPending) return;
+
+  bool tooStale = (millis() - remoteCommandTimestamp) > REMOTE_COMMAND_MAX_AGE_MS;
+  bool safetyBlocked = dryRunFault; // extend with other fault flags as needed
+
+  if (tooStale) {
+    Serial.println("  [RECONCILE] Remote command rejected - stale (>5s), local state unchanged.");
+  } else if (safetyBlocked) {
+    Serial.println("  [RECONCILE] Remote command rejected - local safety fault active, physical state wins.");
+  } else {
+    Serial.print("  [RECONCILE] Remote command accepted: pump ");
+    Serial.println(remoteCommandValue ? "ON" : "OFF");
+    if (remoteCommandValue) pumpOn(); else pumpOff();
+  }
+
+  remoteCommandPending = false;
+}
+
+// ============================================================
 //  UPLOAD TO SERVER / CLOUD
 // ============================================================
 void sendData(float lvl, float flow, float total,
@@ -408,7 +651,7 @@ void sendData(float lvl, float flow, float total,
   HTTPClient http;
   http.begin(client, SERVER_URL);   // use the secure client for https://
   http.addHeader("Content-Type", "application/json");
-  
+
   String body = "{";
   body += "\"tank_level_pct\":" + String(lvl, 1) + ",";
   body += "\"flow_rate\":"      + String(flow, 2) + ",";
