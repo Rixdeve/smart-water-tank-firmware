@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <WiFiClientSecure.h>
 
 #define TRIG_PIN     5
 #define ECHO_PIN     18
@@ -14,7 +15,7 @@
 #define TURB_PIN     34
 #define PH_PIN       35
 
-const char* SERVER_URL = "http://10.30.156.156:8000/sensor-reading";
+const char* SERVER_URL = "https://smart-water-tank-api.onrender.com/sensor-reading";
 
 float EMPTY_DISTANCE_CM = 44.0;
 float FULL_DISTANCE_CM  = 5.0;
@@ -401,10 +402,13 @@ void sendData(float lvl, float flow, float total,
     Serial.println("  [offline] upload skipped, edge logic continues");
     return;
   }
-  HTTPClient http;
-  http.begin(SERVER_URL);
-  http.addHeader("Content-Type", "application/json");
+  WiFiClientSecure client;
+  client.setInsecure();  // skip certificate validation (simplest option for Render)
 
+  HTTPClient http;
+  http.begin(client, SERVER_URL);   // use the secure client for https://
+  http.addHeader("Content-Type", "application/json");
+  
   String body = "{";
   body += "\"tank_level_pct\":" + String(lvl, 1) + ",";
   body += "\"flow_rate\":"      + String(flow, 2) + ",";
