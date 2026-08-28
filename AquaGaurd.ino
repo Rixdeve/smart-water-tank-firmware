@@ -21,6 +21,16 @@ float EMPTY_DISTANCE_CM = 44.0;
 float FULL_DISTANCE_CM  = 5.0;
 float TANK_CAPACITY_L   = 650.0;
 
+// ---------------- SENSOR PHYSICAL LIMITS (backend-managed) ----------------
+// The JSN-SR04T cannot reliably measure closer than its blind zone,
+// or beyond its maximum range. These are fetched from the cloud
+// backend on boot (single source of truth, also editable from the
+// app), but default to safe hardcoded values if the device is
+// offline at boot - the device must remain fully functional without
+// connectivity, consistent with the offline-first design.
+float MIN_DISTANCE_CM = 22.0;   // JSN-SR04T blind zone - hardcoded safe default
+float MAX_DISTANCE_CM = 400.0;  // JSN-SR04T max reliable range - hardcoded safe default
+
 //WATER QUALITY CALIBRATION
 float PH_SLOPE  = -5.70;
 float PH_OFFSET = 21.34;
@@ -41,6 +51,8 @@ unsigned long lastFlowCalc = 0;
 
 unsigned long lastSend = 0;
 const unsigned long SEND_INTERVAL = 5000;
+unsigned long lastConfigSync = 0;
+const unsigned long CONFIG_SYNC_INTERVAL = 60000; // resync config every 60s
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature tempSensor(&oneWire);
@@ -88,6 +100,30 @@ bool remoteCommandValue = false;
 unsigned long remoteCommandTimestamp = 0;
 const unsigned long REMOTE_COMMAND_MAX_AGE_MS = 5000; // reject if older than 5s
 
+// ---------------- ON-DEVICE PREDICTION (offline-first) ----------------
+// Two lightweight methods run natively on the ESP32, requiring no
+// network call and no server-side model:
+//
+// 1. Embedded polynomial regression - the coefficients learned by the
+//    offline-trained scikit-learn model, evaluated here as plain
+//    arithmetic (no ML library needed on-device).
+// 2. On-device moving average - computed from the device's own real
+//    daily usage history, genuinely adaptive to this specific
+//    household rather than the generic training dataset.
+//
+// Fill these in from extract_coefficients.py output:
+const float PRED_INTERCEPT = 621.145665;
+const float PRED_COEF_B    = 1.232212;
+const float PRED_COEF_C    = -0.009455;
+const int   PRED_DAY_INDEX = 101;   // day index used by the trained model
+
+#define USAGE_HISTORY_DAYS 7
+float dailyUsageHistory[USAGE_HISTORY_DAYS] = {0};
+int usageHistoryCount = 0;
+float litresAtDayStart = 0;
+unsigned long lastDayRollover = 0;
+const unsigned long DAY_MS = 86400000UL; // 24h - use a shorter value for demo/testing
+
 Preferences prefs;       // stores Wi-Fi credentials
 Preferences calPrefs;    // stores tank calibration
 WebServer configServer(80);  // Wi-Fi setup portal
@@ -101,16 +137,129 @@ void IRAM_ATTR pulseOutISR() { pulseOut_count++; }
 float readDistance(float tempC);
 
 // ============================================================
+//  ON-DEVICE PREDICTION (Stage 6 - fully offline forecasting)
+// ============================================================
+// Two methods are used for two DIFFERENT purposes, not as
+// interchangeable alternatives - this follows directly from the
+// evaluation in Chapter 5.4.1, where polynomial regression was
+// shown to outperform a moving-average baseline for forecasting
+// non-linear consumption. A flat moving average cannot capture the
+// curvature of human usage patterns, so it is not used as the
+// forecasting method here.
+//
+//   - Polynomial regression (embedded model coefficients): the
+//     PRIMARY forecasting method, used for tomorrow's predicted
+//     usage and time-to-empty. This is the method proven more
+//     accurate in evaluation, now migrated to run on-device.
+//
+//   - Moving average (on-device, real data): used ONLY for leak
+//     detection, where the requirement is simply "is today's usage
+//     abnormal relative to this household's recent average" - a
+//     task moving average is well suited to, unlike forecasting.
+
+// PRIMARY FORECAST: embedded polynomial regression
+float predictPolynomial() {
+  float x = PRED_DAY_INDEX;
+  float y = PRED_INTERCEPT + PRED_COEF_B * x + PRED_COEF_C * x * x;
+  return (y < 0) ? 0 : y;
+}
+
+// LEAK DETECTION ONLY: on-device moving average + std dev of the
+// device's own recent daily usage history.
+float movingAverageOfHistory() {
+  if (usageHistoryCount == 0) return 0;
+  float sum = 0;
+  for (int i = 0; i < usageHistoryCount; i++) sum += dailyUsageHistory[i];
+  return sum / usageHistoryCount;
+}
+
+float stdDevOfHistory(float mean) {
+  if (usageHistoryCount < 2) return 0;
+  float sumSq = 0;
+  for (int i = 0; i < usageHistoryCount; i++) {
+    float diff = dailyUsageHistory[i] - mean;
+    sumSq += diff * diff;
+  }
+  return sqrt(sumSq / usageHistoryCount);
+}
+
+// Call once per "day" (or once per DAY_MS elapsed) to roll the
+// day's total usage into the on-device history window, used for
+// leak detection.
+void updateDailyUsageHistory(float totalLitresOutNow) {
+  if (lastDayRollover == 0) {
+    lastDayRollover = millis();
+    litresAtDayStart = totalLitresOutNow;
+    return;
+  }
+  if (millis() - lastDayRollover < DAY_MS) return;
+
+  float todayUsage = totalLitresOutNow - litresAtDayStart;
+
+  if (usageHistoryCount < USAGE_HISTORY_DAYS) {
+    dailyUsageHistory[usageHistoryCount] = todayUsage;
+    usageHistoryCount++;
+  } else {
+    for (int i = 1; i < USAGE_HISTORY_DAYS; i++) dailyUsageHistory[i - 1] = dailyUsageHistory[i];
+    dailyUsageHistory[USAGE_HISTORY_DAYS - 1] = todayUsage;
+  }
+
+  Serial.printf("  [PREDICT] Day rolled over - usage: %.1fL, history depth: %d/%d\n",
+                todayUsage, usageHistoryCount, USAGE_HISTORY_DAYS);
+
+  litresAtDayStart = totalLitresOutNow;
+  lastDayRollover = millis();
+}
+
+// Combined output: forecast (polynomial) + depletion + leak flag
+// (moving average / std dev), computed entirely on-device.
+//
+// NOTE: this deliberately uses output parameters instead of returning
+// a custom struct. The Arduino IDE auto-generates function prototypes
+// and inserts them immediately after the #include lines, before any
+// struct defined later in the file - a struct RETURN TYPE therefore
+// triggers "does not name a type" even when the struct is correctly
+// defined earlier than the function in the source. Output parameters
+// avoid this entirely since only built-in types appear in the signature.
+void computeEdgePrediction(float levelPct, float todaySoFarLitres,
+                            float &outPredictedLitres, float &outDaysRemaining,
+                            bool &outAlert, bool &outLeakDetected, float &outLeakThreshold) {
+  // Forecast: polynomial regression (proven more accurate in Ch.5.4.1 evaluation)
+  outPredictedLitres = predictPolynomial();
+
+  float availableLitres = (levelPct / 100.0) * TANK_CAPACITY_L;
+  outDaysRemaining = (outPredictedLitres > 0)
+                      ? (availableLitres / outPredictedLitres)
+                      : 999;
+  outAlert = outDaysRemaining < 2.0;
+
+  // Leak detection: moving average + 2 std dev, using real device history
+  if (usageHistoryCount >= 3) {
+    float mean = movingAverageOfHistory();
+    float std = stdDevOfHistory(mean);
+    outLeakThreshold = mean + 2 * std;
+    outLeakDetected = todaySoFarLitres > outLeakThreshold;
+  } else {
+    outLeakThreshold = 0;
+    outLeakDetected = false; // not enough history yet to judge
+  }
+}
+
+// ============================================================
 //  CALIBRATION STORAGE
 // ============================================================
+bool emptyManuallyCalibrated = false;
+
 void loadCalibration() {
   calPrefs.begin("tankcal", false);
   EMPTY_DISTANCE_CM = calPrefs.getFloat("empty", 44.0);
   FULL_DISTANCE_CM  = calPrefs.getFloat("full", 5.0);
   TANK_CAPACITY_L   = calPrefs.getFloat("capacity", 650.0);
+  emptyManuallyCalibrated = calPrefs.getBool("emptyCal", false);
   calPrefs.end();
-  Serial.printf("Loaded calibration - Empty:%.1fcm Full:%.1fcm Capacity:%.0fL\n",
-                EMPTY_DISTANCE_CM, FULL_DISTANCE_CM, TANK_CAPACITY_L);
+  Serial.printf("Loaded calibration - Empty:%.1fcm Full:%.1fcm Capacity:%.0fL (manually calibrated: %s)\n",
+                EMPTY_DISTANCE_CM, FULL_DISTANCE_CM, TANK_CAPACITY_L,
+                emptyManuallyCalibrated ? "yes" : "no - using estimate");
 }
 
 void saveCalibration() {
@@ -118,6 +267,7 @@ void saveCalibration() {
   calPrefs.putFloat("empty", EMPTY_DISTANCE_CM);
   calPrefs.putFloat("full", FULL_DISTANCE_CM);
   calPrefs.putFloat("capacity", TANK_CAPACITY_L);
+  calPrefs.putBool("emptyCal", emptyManuallyCalibrated);
   calPrefs.end();
 }
 
@@ -148,6 +298,7 @@ void setup() {
   tempSensor.begin();
   loadCalibration();          // load saved tank calibration (or defaults)
   connectWiFi();               // app-driven Wi-Fi setup / reconnect
+  fetchDeviceConfig();          // sync capacity + sensor limits from cloud (advisory)
   setupCalibrationEndpoints(); // start the tank calibration web server
 
   Serial.println("Sensors initialised. Starting readings...\n");
@@ -165,10 +316,20 @@ void loop() {
 
   float distance = readDistance(tempC);
   float levelPct = 0;
-  if (distance >= 0) {
+  if (distance >= 0 && distance >= MIN_DISTANCE_CM && distance <= MAX_DISTANCE_CM) {
     levelPct = (EMPTY_DISTANCE_CM - distance) /
                (EMPTY_DISTANCE_CM - FULL_DISTANCE_CM) * 100.0;
     levelPct = constrain(levelPct, 0, 100);
+  } else if (distance >= 0) {
+    // Reading was received but falls outside the sensor's physical
+    // range - treat as unreliable rather than acting on it.
+    Serial.printf("  [warning] distance %.1fcm outside sensor range [%.0f-%.0fcm] - ignoring this reading\n",
+                  distance, MIN_DISTANCE_CM, MAX_DISTANCE_CM);
+  }
+
+  if (millis() - lastConfigSync >= CONFIG_SYNC_INTERVAL) {
+    fetchDeviceConfig();
+    lastConfigSync = millis();
   }
   float availableLitres = (levelPct / 100.0) * TANK_CAPACITY_L;
 
@@ -232,6 +393,15 @@ void loop() {
     Serial.println("  [SAFETY] Dry-run fault cleared - level recovered.");
   }
 
+  // ON-DEVICE PREDICTION - runs every cycle, no network needed
+  updateDailyUsageHistory(totalLitresOut);
+  float todaySoFar = totalLitresOut - litresAtDayStart;
+  float predPredictedLitres, predDaysRemaining, predLeakThreshold;
+  bool predAlert, predLeakDetected;
+  computeEdgePrediction(levelPct, todaySoFar,
+                         predPredictedLitres, predDaysRemaining,
+                         predAlert, predLeakDetected, predLeakThreshold);
+
   Serial.println("---------------------------------------");
   Serial.printf("Temperature : %.1f C\n", tempC);
   Serial.printf("Distance    : %.1f cm\n", distance);
@@ -243,6 +413,17 @@ void loop() {
   Serial.printf("Pump        : %s (%s)%s\n", pumpStatus ? "ON" : "OFF",
                 qualitySafe ? "SAFE" : "UNSAFE",
                 dryRunFault ? " [DRY-RUN FAULT]" : "");
+  Serial.printf("Predicted   : %.1f L/day (polynomial) | Days left: %.1f%s\n",
+                predPredictedLitres, predDaysRemaining,
+                predAlert ? " [LOW - refill soon]" : "");
+  if (usageHistoryCount >= 3) {
+    Serial.printf("Leak check  : today %.1fL vs threshold %.1fL%s\n",
+                  todaySoFar, predLeakThreshold,
+                  predLeakDetected ? " [POSSIBLE LEAK]" : " [normal]");
+  } else {
+    Serial.printf("Leak check  : building history (%d/%d days)\n",
+                  usageHistoryCount, USAGE_HISTORY_DAYS);
+  }
 
   if (millis() - lastSend >= SEND_INTERVAL) {
     handleConnectivityAndSync(levelPct, flowRateOut, totalLitresOut, phValue, turbidity, pumpStatus);
@@ -309,6 +490,75 @@ void pumpOn()  { digitalWrite(RELAY_PIN, HIGH); pumpStatus = true;  }
 void pumpOff() { digitalWrite(RELAY_PIN, LOW);  pumpStatus = false; }
 
 // ============================================================
+//  DEVICE CONFIG SYNC (cloud is the single source of truth)
+// ============================================================
+// Fetches tank capacity and sensor physical limits from the cloud
+// backend. Called once at boot and again periodically. If the
+// device is offline, this simply fails silently and the existing
+// (hardcoded default, or last successfully fetched) values remain
+// in use - config sync is advisory only, never a hard dependency,
+// so the device stays fully operational without connectivity.
+void fetchDeviceConfig() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("  [CONFIG] Offline - using existing/default sensor limits.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  String cfgUrl = String(SERVER_URL);
+  cfgUrl.replace("/sensor-reading", "/device-config");
+
+  http.begin(client, cfgUrl);
+  int code = http.GET();
+  if (code == 200) {
+    String resp = http.getString();
+
+    int capIdx = resp.indexOf("\"tank_capacity_liters\":");
+    if (capIdx >= 0) {
+      float val = resp.substring(capIdx + 23).toFloat();
+      if (val > 0) { TANK_CAPACITY_L = val; saveCalibration(); }
+    }
+
+    // Only adopt the manufacturer-spec ESTIMATE if this device has
+    // never had a real, live empty-tank calibration performed. Once
+    // a real measurement exists, it always takes precedence over an
+    // average derived from standard tank dimensions.
+    if (!emptyManuallyCalibrated) {
+      int estIdx = resp.indexOf("\"estimated_empty_distance_cm\":");
+      if (estIdx >= 0) {
+        float val = resp.substring(estIdx + 30).toFloat();
+        if (val > 0) {
+          EMPTY_DISTANCE_CM = val;
+          saveCalibration();
+          Serial.printf("  [CONFIG] Using spec-estimated empty distance: %.1fcm (not yet manually calibrated)\n", val);
+        }
+      }
+    }
+
+    int minIdx = resp.indexOf("\"min_distance_cm\":");
+    if (minIdx >= 0) {
+      float val = resp.substring(minIdx + 19).toFloat();
+      if (val > 0) MIN_DISTANCE_CM = val;
+    }
+
+    int maxIdx = resp.indexOf("\"max_distance_cm\":");
+    if (maxIdx >= 0) {
+      float val = resp.substring(maxIdx + 19).toFloat();
+      if (val > 0) MAX_DISTANCE_CM = val;
+    }
+
+    Serial.printf("  [CONFIG] Synced from cloud - Capacity:%.0fL, Sensor range:%.0f-%.0fcm\n",
+                  TANK_CAPACITY_L, MIN_DISTANCE_CM, MAX_DISTANCE_CM);
+  } else {
+    Serial.printf("  [CONFIG] Fetch failed (HTTP %d) - using existing sensor limits.\n", code);
+  }
+  http.end();
+}
+
+// ============================================================
 //  TANK CALIBRATION ENDPOINTS (app talks to ESP32 on port 81)
 // ============================================================
 void setupCalibrationEndpoints() {
@@ -318,13 +568,26 @@ void setupCalibrationEndpoints() {
     if (tempC == DEVICE_DISCONNECTED_C) tempC = 25.0;
     float d = readDistance(tempC);
     calServer.sendHeader("Access-Control-Allow-Origin", "*");
-    if (d >= 0) {
-      EMPTY_DISTANCE_CM = d;
-      saveCalibration();
-      calServer.send(200, "application/json", "{\"empty_distance_cm\":" + String(d, 1) + "}");
-    } else {
-      calServer.send(500, "application/json", "{\"error\":\"sensor read failed\"}");
+    if (d < 0) {
+      calServer.send(500, "application/json", "{\"error\":\"sensor read failed - no echo received\"}");
+      return;
     }
+    if (d < MIN_DISTANCE_CM) {
+      calServer.send(422, "application/json",
+        "{\"error\":\"reading " + String(d, 1) + "cm is closer than the sensor's minimum range of " +
+        String(MIN_DISTANCE_CM, 0) + "cm. Check the sensor is mounted correctly.\"}");
+      return;
+    }
+    if (d > MAX_DISTANCE_CM) {
+      calServer.send(422, "application/json",
+        "{\"error\":\"reading " + String(d, 1) + "cm exceeds the sensor's maximum range of " +
+        String(MAX_DISTANCE_CM, 0) + "cm. Check the tank is actually empty and in range.\"}");
+      return;
+    }
+    EMPTY_DISTANCE_CM = d;
+    emptyManuallyCalibrated = true; // real measurement now overrides any spec estimate
+    saveCalibration();
+    calServer.send(200, "application/json", "{\"empty_distance_cm\":" + String(d, 1) + "}");
   });
 
   calServer.on("/calibrate-full", HTTP_POST, []() {
@@ -333,13 +596,30 @@ void setupCalibrationEndpoints() {
     if (tempC == DEVICE_DISCONNECTED_C) tempC = 25.0;
     float d = readDistance(tempC);
     calServer.sendHeader("Access-Control-Allow-Origin", "*");
-    if (d >= 0) {
-      FULL_DISTANCE_CM = d;
-      saveCalibration();
-      calServer.send(200, "application/json", "{\"full_distance_cm\":" + String(d, 1) + "}");
-    } else {
-      calServer.send(500, "application/json", "{\"error\":\"sensor read failed\"}");
+    if (d < 0) {
+      calServer.send(500, "application/json", "{\"error\":\"sensor read failed - no echo received\"}");
+      return;
     }
+    if (d < MIN_DISTANCE_CM) {
+      // This is the critical case from the tank spec chart: if the
+      // sensor is mounted too close to the maximum water level, the
+      // "Full" reading falls inside the sensor's blind zone and can
+      // never be measured reliably. Reject with a clear explanation
+      // rather than silently accepting an unreliable calibration.
+      calServer.send(422, "application/json",
+        "{\"error\":\"reading " + String(d, 1) + "cm is closer than the sensor's minimum range of " +
+        String(MIN_DISTANCE_CM, 0) + "cm. The sensor needs to be mounted further above the maximum water level, or this tank/mounting combination cannot be reliably measured.\"}");
+      return;
+    }
+    if (d > MAX_DISTANCE_CM) {
+      calServer.send(422, "application/json",
+        "{\"error\":\"reading " + String(d, 1) + "cm exceeds the sensor's maximum range of " +
+        String(MAX_DISTANCE_CM, 0) + "cm.\"}");
+      return;
+    }
+    FULL_DISTANCE_CM = d;
+    saveCalibration();
+    calServer.send(200, "application/json", "{\"full_distance_cm\":" + String(d, 1) + "}");
   });
 
   calServer.on("/set-capacity", HTTP_POST, []() {
@@ -483,6 +763,8 @@ void connectWiFi() {
     startConfigMode();  // blocks until configured + reboots, never returns
   }
 }
+
+
 
 // ============================================================
 //  SPLIT-BRAIN RECONCILIATION
