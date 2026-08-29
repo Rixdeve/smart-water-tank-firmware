@@ -21,6 +21,36 @@ float EMPTY_DISTANCE_CM = 44.0;
 float FULL_DISTANCE_CM  = 5.0;
 float TANK_CAPACITY_L   = 650.0;
 
+// ---------------- TANK GEOMETRY (frustum / tapered container) ----------------
+// DEMO-ONLY: this method makes the level/volume calculation correct
+// for a tapered container (wider top, narrower bottom) instead of
+// assuming a straight-sided cylinder. Only these three constants need
+// to change to reuse this exact method for a different tank - nothing
+// else in the file depends on this specific tank's dimensions.
+const float TANK_HEIGHT_CM        = 55.0;   // full physical height of the container
+const float TANK_TOP_RADIUS_CM    = 20.0;   // top diameter (40cm) / 2
+const float TANK_BOTTOM_RADIUS_CM = 13.5;   // bottom diameter (27cm) / 2
+
+// Radius of the tank's cross-section at a given height above the
+// bottom (linear interpolation - valid for any frustum shape).
+float radiusAtHeight(float heightCm) {
+  float h = constrain(heightCm, 0, TANK_HEIGHT_CM);
+  return TANK_BOTTOM_RADIUS_CM +
+         (TANK_TOP_RADIUS_CM - TANK_BOTTOM_RADIUS_CM) * (h / TANK_HEIGHT_CM);
+}
+
+// Volume, in litres, of water filling the tank from the bottom up to
+// heightCm - the frustum formed between the tank's bottom radius and
+// the (generally smaller) radius at the current water surface.
+float volumeAtHeightL(float heightCm) {
+  float h = constrain(heightCm, 0, TANK_HEIGHT_CM);
+  if (h <= 0) return 0;
+  float rTop = radiusAtHeight(h);
+  float volumeCm3 = (PI * h / 3.0) *
+    (sq(TANK_BOTTOM_RADIUS_CM) + TANK_BOTTOM_RADIUS_CM * rTop + sq(rTop));
+  return volumeCm3 / 1000.0; // cm3 -> litres
+}
+
 // ---------------- SENSOR PHYSICAL LIMITS (backend-managed) ----------------
 // The JSN-SR04T cannot reliably measure closer than its blind zone,
 // or beyond its maximum range. These are fetched from the cloud
@@ -34,7 +64,7 @@ float MAX_DISTANCE_CM = 400.0;  // JSN-SR04T max reliable range - hardcoded safe
 //WATER QUALITY CALIBRATION
 float PH_SLOPE  = -5.70;
 float PH_OFFSET = 21.34;
-const float TURB_CLEAR_RAW = 2108.0;
+const float TURB_CLEAR_RAW = 1150.0;
 const float TURB_DIRTY_RAW = 1740.0;
 const float TURB_MAX_NTU   = 100.0;
 
@@ -42,6 +72,14 @@ const float PH_MIN = 6.5, PH_MAX = 8.5;
 const float TURBIDITY_MAX_NTU = 5.0;
 const float PUMP_ON_LEVEL  = 20.0;
 const float PUMP_OFF_LEVEL = 90.0;
+
+// Below this level, the pH/turbidity probes are assumed too shallow
+// to be reliably submerged, so their readings cannot be trusted as
+// either "safe" or "unsafe" - they are simply invalid. Quality gating
+// is skipped below this threshold so an empty tank can still perform
+// its initial fill; once enough water has accumulated for the probes
+// to be properly wet, normal quality-based safety gating resumes.
+const float MIN_LEVEL_FOR_QUALITY_PCT = 50.0;
 
 // ---------------- FLOW ----------------
 volatile int pulseIn_count = 0, pulseOut_count = 0;
@@ -316,9 +354,15 @@ void loop() {
 
   float distance = readDistance(tempC);
   float levelPct = 0;
+  float availableLitres = 0;
   if (distance >= 0 && distance >= MIN_DISTANCE_CM && distance <= MAX_DISTANCE_CM) {
-    levelPct = (EMPTY_DISTANCE_CM - distance) /
-               (EMPTY_DISTANCE_CM - FULL_DISTANCE_CM) * 100.0;
+    // Water height above the tank bottom, converted to a true frustum
+    // volume (see volumeAtHeightL() above) rather than a flat height
+    // percentage, since this container tapers from top to bottom.
+    float waterHeightCm = EMPTY_DISTANCE_CM - distance;
+    waterHeightCm = constrain(waterHeightCm, 0, TANK_HEIGHT_CM);
+    availableLitres = volumeAtHeightL(waterHeightCm);
+    levelPct = (TANK_CAPACITY_L > 0) ? (availableLitres / TANK_CAPACITY_L) * 100.0 : 0;
     levelPct = constrain(levelPct, 0, 100);
   } else if (distance >= 0) {
     // Reading was received but falls outside the sensor's physical
@@ -331,14 +375,18 @@ void loop() {
     fetchDeviceConfig();
     lastConfigSync = millis();
   }
-  float availableLitres = (levelPct / 100.0) * TANK_CAPACITY_L;
 
   updateFlow();
 
   float phValue   = readPH();
   float turbidity = readTurbidity();
-  bool  qualitySafe = (phValue >= PH_MIN && phValue <= PH_MAX &&
-                       turbidity <= TURBIDITY_MAX_NTU);
+  bool sensorsSubmerged = levelPct >= MIN_LEVEL_FOR_QUALITY_PCT;
+  bool  qualitySafe = !sensorsSubmerged ||
+                       (phValue >= PH_MIN && phValue <= PH_MAX &&
+                        turbidity <= TURBIDITY_MAX_NTU);
+  if (!sensorsSubmerged) {
+    Serial.println("  [QUALITY] Level too low for reliable pH/turbidity reading - quality gate bypassed for initial fill.");
+  }
 
   // EDGE FAIL-SAFE PUMP LOGIC - runs locally, always
   if (!qualitySafe) {
@@ -479,6 +527,7 @@ float readTurbidity() {
   long sum = 0;
   for (int i = 0; i < 20; i++) { sum += analogRead(TURB_PIN); delay(5); }
   float raw = sum / 20.0;
+  Serial.print("  [debug] Turbidity raw ADC: "); Serial.println(raw);  // ADD BACK
   float ntu = (TURB_CLEAR_RAW - raw) / (TURB_CLEAR_RAW - TURB_DIRTY_RAW) * TURB_MAX_NTU;
   return constrain(ntu, 0, TURB_MAX_NTU);
 }
@@ -618,8 +667,16 @@ void setupCalibrationEndpoints() {
       return;
     }
     FULL_DISTANCE_CM = d;
+    // DEMO: recompute capacity from the true frustum geometry using
+    // the calibrated "full" water height, rather than trusting a
+    // manually typed capacity value. Only this line changed from the
+    // original endpoint logic.
+    float fullWaterHeightCm = constrain(EMPTY_DISTANCE_CM - FULL_DISTANCE_CM, 0, TANK_HEIGHT_CM);
+    TANK_CAPACITY_L = volumeAtHeightL(fullWaterHeightCm);
     saveCalibration();
-    calServer.send(200, "application/json", "{\"full_distance_cm\":" + String(d, 1) + "}");
+    calServer.send(200, "application/json",
+      "{\"full_distance_cm\":" + String(d, 1) +
+      ",\"computed_capacity_l\":" + String(TANK_CAPACITY_L, 1) + "}");
   });
 
   calServer.on("/set-capacity", HTTP_POST, []() {
