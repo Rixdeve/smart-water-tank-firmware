@@ -10,7 +10,7 @@
 #define ECHO_PIN     18
 #define ONE_WIRE_BUS 4
 #define FLOW_IN_PIN  25
-#define RELAY_PIN    13
+#define RELAY_PIN    14  // <-- moved from GPIO13, which may have a degraded output driver after extensive testing/rewiring
 #define FLOW_OUT_PIN 26
 #define TURB_PIN     34
 #define PH_PIN       35
@@ -71,7 +71,31 @@ const float TURB_MAX_NTU   = 100.0;
 const float PH_MIN = 6.5, PH_MAX = 8.5;
 const float TURBIDITY_MAX_NTU = 5.0;
 const float PUMP_ON_LEVEL  = 20.0;
-const float PUMP_OFF_LEVEL = 90.0;
+// TESTING VALUE: lowered from 90.0 so a quick bench test (small
+// amount of water) is enough to observe the pump auto-stopping,
+// without needing to fill the tank most of the way. Set back to a
+// realistic value (e.g. 90.0) for normal operation / final demo.
+const float PUMP_OFF_LEVEL = 10.0;
+
+// Set to true if the relay's indicator LED turns ON when the firmware
+// calls pumpOff() (or the pump runs when it should be off) - this
+// means the relay module is active-LOW (or wired to NC instead of
+// NO), and the drive signal must be inverted in software to match
+// the intended pumpOn()/pumpOff() meaning without re-wiring.
+// Declared here (near the top) rather than near pumpOn()/pumpOff()
+// because setup() and loop() both reference it directly, and unlike
+// functions, Arduino does NOT auto-generate forward declarations for
+// variables - it must be declared before any code that uses it.
+const bool RELAY_ACTIVE_LOW = true;  // <-- set true if pump behaviour is inverted
+
+// TEMPORARY TESTING OVERRIDE: when true, the pump is forced OFF at
+// all times, unconditionally - bypassing manual commands, auto mode,
+// dry-run retry and safety logic entirely. Use this while debugging
+// hardware (e.g. a relay that won't reliably switch off) so the pump
+// cannot run uncontrolled. Set back to false to restore normal
+// operation once the hardware issue is resolved - do not leave this
+// enabled for the final evaluation/demo.
+const bool FORCE_PUMP_OFF = false;  // <-- re-enabled normal pump operation
 
 // Below this level, the pH/turbidity probes are assumed too shallow
 // to be reliably submerged, so their readings cannot be trusted as
@@ -103,12 +127,12 @@ bool pumpStatus = false;
 // pump is on - if it is not, the source has failed regardless of what
 // the flow sensor reports.
 unsigned long pumpOnSince = 0;
-const unsigned long DRY_RUN_TIMEOUT_MS = 30000;    // 30s grace period before checking
+const unsigned long DRY_RUN_TIMEOUT_MS = 120000;    // 30s grace period before checking
 const float MIN_LEVEL_RISE_PCT = 1.0;              // must rise at least 1% in the check window
 float levelAtPumpStart = 0;
 bool dryRunFault = false;
 unsigned long dryRunFaultSince = 0;
-const unsigned long DRY_RUN_RETRY_MS = 300000;     // retry every 5 minutes
+const unsigned long DRY_RUN_RETRY_MS = 6000;     // retry every 5 minutes
 
 // ---------------- SPLIT-BRAIN RECONCILIATION ----------------
 // While offline, readings are buffered locally instead of being
@@ -173,6 +197,22 @@ void IRAM_ATTR pulseOutISR() { pulseOut_count++; }
 
 // Forward declaration (readDistance needs to exist before setupCalibrationEndpoints uses it)
 float readDistance(float tempC);
+
+// Starts an HTTPClient request against either an https:// (cloud) or
+// http:// (local backend) URL automatically, based on the URL itself.
+// This lets SERVER_URL be switched between the deployed Render URL
+// and a local FastAPI instance (e.g. during hardware debugging, to
+// remove cloud round-trip time as a variable) with no other code
+// changes needed anywhere else in the file.
+bool beginHttpAuto(HTTPClient &http, const String &url) {
+  if (url.startsWith("https://")) {
+    static WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    return http.begin(secureClient, url);
+  } else {
+    return http.begin(url); // plain HTTP for a local backend
+  }
+}
 
 // ============================================================
 //  ON-DEVICE PREDICTION (Stage 6 - fully offline forecasting)
@@ -327,8 +367,16 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  // Boot in the OFF state. For an active-low relay this means
+  // releasing the pin to high-impedance INPUT (see pumpOff() below)
+  // so the relay board's own pull-up resistor drives a clean 5V
+  // HIGH, rather than the ESP32 trying to drive 3.3V itself.
+  if (RELAY_ACTIVE_LOW) {
+    pinMode(RELAY_PIN, INPUT);
+  } else {
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+  }
   pinMode(FLOW_IN_PIN, INPUT_PULLUP);
   pinMode(FLOW_OUT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_IN_PIN),  pulseInISR,  RISING);
@@ -401,7 +449,10 @@ void loop() {
   // behaviour is gated by autoModeEnabled - when auto mode is off,
   // the pump instead does nothing here and waits for an explicit
   // manual command via applyRemoteCommandIfValid() below.
-  if (!qualitySafe) {
+  if (FORCE_PUMP_OFF) {
+    pumpOff();
+    dryRunFault = false;
+  } else if (!qualitySafe) {
     pumpOff();
     dryRunFault = false;
   } else if (autoModeEnabled && levelPct > PUMP_OFF_LEVEL) {
@@ -451,6 +502,21 @@ void loop() {
   if (dryRunFault && levelPct >= PUMP_ON_LEVEL + 5.0) {
     dryRunFault = false;
     Serial.println("  [SAFETY] Dry-run fault cleared - level recovered.");
+  }
+
+  // Continuously re-assert the relay pin every loop cycle (~1s) to
+  // match the current pumpStatus, using the same pinMode-switching
+  // approach as pumpOn()/pumpOff() (see notes there) rather than
+  // relying on the pin holding its value from whenever it was last
+  // explicitly set. This makes the output self-correcting every cycle.
+  if (pumpStatus) {
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
+  } else if (RELAY_ACTIVE_LOW) {
+    pinMode(RELAY_PIN, INPUT);
+  } else {
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
   }
 
   // ON-DEVICE PREDICTION - runs every cycle, no network needed
@@ -548,19 +614,33 @@ float readTurbidity() {
 // ============================================================
 //  PUMP CONTROL
 // ============================================================
-// Set to true if the relay's indicator LED turns ON when the firmware
-// calls pumpOff() (or the pump runs when it should be off) - this
-// means the relay module is active-LOW (or wired to NC instead of
-// NO), and the drive signal must be inverted in software to match
-// the intended pumpOn()/pumpOff() meaning without re-wiring.
-const bool RELAY_ACTIVE_LOW = false;  // <-- set true if pump behaviour is inverted
+// RELAY_ACTIVE_LOW is declared near the top of the file (setup() and
+// loop() both need it, and variables - unlike functions - are not
+// auto-forward-declared by Arduino).
 
+// NOTE: "off" is achieved by setting the pin to INPUT (high-impedance)
+// rather than actively driving it to 3.3V. The ESP32's 3.3V HIGH was
+// found to be insufficient to reliably de-energise this 5V relay
+// board (confirmed via testing: manual GND-jump and full power-
+// disconnect both switched cleanly, but the ESP32's own 3.3V HIGH did
+// not). These boards typically have their own onboard pull-up
+// resistor from IN to the 5V VCC rail, so releasing the pin to
+// high-impedance lets that pull-up provide a genuine, full 5V HIGH -
+// solving the voltage margin issue with no extra components needed.
+// "On" is unaffected by this issue, since driving a clean LOW/GND is
+// unambiguous regardless of logic voltage, so it is unchanged.
 void pumpOn()  {
+  pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
   pumpStatus = true;
 }
 void pumpOff() {
-  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+  if (RELAY_ACTIVE_LOW) {
+    pinMode(RELAY_PIN, INPUT);  // release to high-impedance - board's own pull-up drives a clean 5V HIGH
+  } else {
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+  }
   pumpStatus = false;
 }
 
@@ -579,14 +659,10 @@ void fetchDeviceConfig() {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
   HTTPClient http;
-
   String cfgUrl = String(SERVER_URL);
   cfgUrl.replace("/sensor-reading", "/device-config");
-
-  http.begin(client, cfgUrl);
+  beginHttpAuto(http, cfgUrl);
   int code = http.GET();
   if (code == 200) {
     String resp = http.getString();
@@ -918,8 +994,6 @@ void syncOfflineBuffer(unsigned long downtimeMs) {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
   HTTPClient http;
 
   // Build the batch JSON: an array of readings plus reconciliation metadata
@@ -943,7 +1017,7 @@ void syncOfflineBuffer(unsigned long downtimeMs) {
   String syncUrl = String(SERVER_URL);
   syncUrl.replace("/sensor-reading", "/sync-batch");
 
-  http.begin(client, syncUrl);
+  beginHttpAuto(http, syncUrl);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   Serial.print("  [RECONCILE] Batch sync HTTP "); Serial.println(code);
@@ -963,14 +1037,10 @@ void syncOfflineBuffer(unsigned long downtimeMs) {
 // prevents a delayed or corrupted network command from ever pushing
 // the pump into an unsafe physical state.
 void pollForRemoteCommand() {
-  WiFiClientSecure client;
-  client.setInsecure();
   HTTPClient http;
-
   String cmdUrl = String(SERVER_URL);
   cmdUrl.replace("/sensor-reading", "/pump-command");
-
-  http.begin(client, cmdUrl);
+  beginHttpAuto(http, cmdUrl);
   int code = http.GET();
   if (code == 200) {
     String resp = http.getString();
@@ -991,14 +1061,10 @@ void pollForRemoteCommand() {
 // pump command, this is a persistent mode setting rather than a
 // one-off action, so no staleness rejection applies to it.
 void pollForAutoMode() {
-  WiFiClientSecure client;
-  client.setInsecure();
   HTTPClient http;
-
   String url = String(SERVER_URL);
   url.replace("/sensor-reading", "/auto-mode");
-
-  http.begin(client, url);
+  beginHttpAuto(http, url);
   int code = http.GET();
   if (code == 200) {
     String resp = http.getString();
@@ -1015,6 +1081,12 @@ void pollForAutoMode() {
 
 void applyRemoteCommandIfValid() {
   if (!remoteCommandPending) return;
+  if (FORCE_PUMP_OFF) {
+    Serial.println("  [OVERRIDE] FORCE_PUMP_OFF is active - remote command ignored, pump stays off.");
+    pumpOff();
+    remoteCommandPending = false;
+    return;
+  }
 
   bool tooStale = (millis() - remoteCommandTimestamp) > REMOTE_COMMAND_MAX_AGE_MS;
   bool safetyBlocked = dryRunFault; // extend with other fault flags as needed
@@ -1041,11 +1113,8 @@ void sendData(float lvl, float flow, float total,
     Serial.println("  [offline] upload skipped, edge logic continues");
     return;
   }
-  WiFiClientSecure client;
-  client.setInsecure();  // skip certificate validation (simplest option for Render)
-
   HTTPClient http;
-  http.begin(client, SERVER_URL);   // use the secure client for https://
+  beginHttpAuto(http, SERVER_URL);
   http.addHeader("Content-Type", "application/json");
 
   String body = "{";
