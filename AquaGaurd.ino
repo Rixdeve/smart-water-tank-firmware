@@ -1,3 +1,4 @@
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -10,58 +11,58 @@
 #define ECHO_PIN     18
 #define ONE_WIRE_BUS 4
 #define FLOW_IN_PIN  25
-#define RELAY_PIN    14  // <-- moved from GPIO13, which may have a degraded output driver after extensive testing/rewiring
+#define RELAY_PIN    14
 #define FLOW_OUT_PIN 26
 #define TURB_PIN     34
 #define PH_PIN       35
 
-const char* SERVER_URL = "https://smart-water-tank-api.onrender.com/sensor-reading";
+const char* SERVER_URL = "https:
 
 float EMPTY_DISTANCE_CM = 44.0;
 float FULL_DISTANCE_CM  = 5.0;
 float TANK_CAPACITY_L   = 650.0;
 
-// ---------------- TANK GEOMETRY (frustum / tapered container) ----------------
-// DEMO-ONLY: this method makes the level/volume calculation correct
-// for a tapered container (wider top, narrower bottom) instead of
-// assuming a straight-sided cylinder. Only these three constants need
-// to change to reuse this exact method for a different tank - nothing
-// else in the file depends on this specific tank's dimensions.
-const float TANK_HEIGHT_CM        = 55.0;   // full physical height of the container
-const float TANK_TOP_RADIUS_CM    = 20.0;   // top diameter (40cm) / 2
-const float TANK_BOTTOM_RADIUS_CM = 13.5;   // bottom diameter (27cm) / 2
 
-// Radius of the tank's cross-section at a given height above the
-// bottom (linear interpolation - valid for any frustum shape).
+
+
+
+
+
+const float TANK_HEIGHT_CM        = 55.0;
+const float TANK_TOP_RADIUS_CM    = 20.0;
+const float TANK_BOTTOM_RADIUS_CM = 13.5;
+
+
+
 float radiusAtHeight(float heightCm) {
   float h = constrain(heightCm, 0, TANK_HEIGHT_CM);
   return TANK_BOTTOM_RADIUS_CM +
          (TANK_TOP_RADIUS_CM - TANK_BOTTOM_RADIUS_CM) * (h / TANK_HEIGHT_CM);
 }
 
-// Volume, in litres, of water filling the tank from the bottom up to
-// heightCm - the frustum formed between the tank's bottom radius and
-// the (generally smaller) radius at the current water surface.
+
+
+
 float volumeAtHeightL(float heightCm) {
   float h = constrain(heightCm, 0, TANK_HEIGHT_CM);
   if (h <= 0) return 0;
   float rTop = radiusAtHeight(h);
   float volumeCm3 = (PI * h / 3.0) *
     (sq(TANK_BOTTOM_RADIUS_CM) + TANK_BOTTOM_RADIUS_CM * rTop + sq(rTop));
-  return volumeCm3 / 1000.0; // cm3 -> litres
+  return volumeCm3 / 1000.0;
 }
 
-// ---------------- SENSOR PHYSICAL LIMITS (backend-managed) ----------------
-// The JSN-SR04T cannot reliably measure closer than its blind zone,
-// or beyond its maximum range. These are fetched from the cloud
-// backend on boot (single source of truth, also editable from the
-// app), but default to safe hardcoded values if the device is
-// offline at boot - the device must remain fully functional without
-// connectivity, consistent with the offline-first design.
-float MIN_DISTANCE_CM = 22.0;   // JSN-SR04T blind zone - hardcoded safe default
-float MAX_DISTANCE_CM = 400.0;  // JSN-SR04T max reliable range - hardcoded safe default
 
-//WATER QUALITY CALIBRATION
+
+
+
+
+
+
+float MIN_DISTANCE_CM = 22.0;
+float MAX_DISTANCE_CM = 400.0;
+
+
 float PH_SLOPE  = -5.70;
 float PH_OFFSET = 21.34;
 const float TURB_CLEAR_RAW = 1150.0;
@@ -71,41 +72,41 @@ const float TURB_MAX_NTU   = 100.0;
 const float PH_MIN = 6.5, PH_MAX = 8.5;
 const float TURBIDITY_MAX_NTU = 5.0;
 const float PUMP_ON_LEVEL  = 20.0;
-// TESTING VALUE: lowered from 90.0 so a quick bench test (small
-// amount of water) is enough to observe the pump auto-stopping,
-// without needing to fill the tank most of the way. Set back to a
-// realistic value (e.g. 90.0) for normal operation / final demo.
+
+
+
+
 const float PUMP_OFF_LEVEL = 10.0;
 
-// Set to true if the relay's indicator LED turns ON when the firmware
-// calls pumpOff() (or the pump runs when it should be off) - this
-// means the relay module is active-LOW (or wired to NC instead of
-// NO), and the drive signal must be inverted in software to match
-// the intended pumpOn()/pumpOff() meaning without re-wiring.
-// Declared here (near the top) rather than near pumpOn()/pumpOff()
-// because setup() and loop() both reference it directly, and unlike
-// functions, Arduino does NOT auto-generate forward declarations for
-// variables - it must be declared before any code that uses it.
-const bool RELAY_ACTIVE_LOW = true;  // <-- set true if pump behaviour is inverted
 
-// TEMPORARY TESTING OVERRIDE: when true, the pump is forced OFF at
-// all times, unconditionally - bypassing manual commands, auto mode,
-// dry-run retry and safety logic entirely. Use this while debugging
-// hardware (e.g. a relay that won't reliably switch off) so the pump
-// cannot run uncontrolled. Set back to false to restore normal
-// operation once the hardware issue is resolved - do not leave this
-// enabled for the final evaluation/demo.
-const bool FORCE_PUMP_OFF = false;  // <-- re-enabled normal pump operation
 
-// Below this level, the pH/turbidity probes are assumed too shallow
-// to be reliably submerged, so their readings cannot be trusted as
-// either "safe" or "unsafe" - they are simply invalid. Quality gating
-// is skipped below this threshold so an empty tank can still perform
-// its initial fill; once enough water has accumulated for the probes
-// to be properly wet, normal quality-based safety gating resumes.
+
+
+
+
+
+
+
+const bool RELAY_ACTIVE_LOW = true;
+
+
+
+
+
+
+
+
+const bool FORCE_PUMP_OFF = false;
+
+
+
+
+
+
+
 const float MIN_LEVEL_FOR_QUALITY_PCT = 8.0;
 
-// ---------------- FLOW ----------------
+
 volatile int pulseIn_count = 0, pulseOut_count = 0;
 float flowRateIn = 0, flowRateOut = 0;
 float totalLitresIn = 0, totalLitresOut = 0;
@@ -114,32 +115,32 @@ unsigned long lastFlowCalc = 0;
 unsigned long lastSend = 0;
 const unsigned long SEND_INTERVAL = 5000;
 unsigned long lastConfigSync = 0;
-const unsigned long CONFIG_SYNC_INTERVAL = 60000; // resync config every 60s
+const unsigned long CONFIG_SYNC_INTERVAL = 60000;
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature tempSensor(&oneWire);
 bool pumpStatus = false;
 
-// ---------------- DRY-RUN / MAINS-FAILURE PROTECTION ----------------
-// NOTE: flow sensor pulses can be triggered by air movement, not only
-// water, so flow rate alone is unreliable for dry-run detection.
-// Instead we check whether the TANK LEVEL is actually rising while the
-// pump is on - if it is not, the source has failed regardless of what
-// the flow sensor reports.
+
+
+
+
+
+
 unsigned long pumpOnSince = 0;
-const unsigned long DRY_RUN_TIMEOUT_MS = 120000;    // 30s grace period before checking
-const float MIN_LEVEL_RISE_PCT = 1.0;              // must rise at least 1% in the check window
+const unsigned long DRY_RUN_TIMEOUT_MS = 120000;
+const float MIN_LEVEL_RISE_PCT = 1.0;
 float levelAtPumpStart = 0;
 bool dryRunFault = false;
 unsigned long dryRunFaultSince = 0;
-const unsigned long DRY_RUN_RETRY_MS = 6000;     // retry every 5 minutes
+const unsigned long DRY_RUN_RETRY_MS = 6000;
 
-// ---------------- SPLIT-BRAIN RECONCILIATION ----------------
-// While offline, readings are buffered locally instead of being
-// dropped. On reconnect, the buffer is uploaded as a single
-// reconciliation batch so the cloud record reflects what the edge
-// logic actually did during the outage - the physical/local state
-// is always treated as the source of truth, never the reverse.
+
+
+
+
+
+
 #define OFFLINE_BUFFER_SIZE 40
 struct BufferedReading {
   unsigned long millisAtCapture;
@@ -156,89 +157,89 @@ bool wasOffline = false;
 unsigned long offlineSince = 0;
 unsigned long reconnectCount = 0;
 
-// Remote pump command state (for manual override from the app)
+
 bool remoteCommandPending = false;
 bool remoteCommandValue = false;
 unsigned long remoteCommandTimestamp = 0;
-const unsigned long REMOTE_COMMAND_MAX_AGE_MS = 20000; // reject if older than 20s (must exceed SEND_INTERVAL, or a command polled at the end of one cycle would always appear stale by the time it's applied next cycle)
+const unsigned long REMOTE_COMMAND_MAX_AGE_MS = 20000;
 
-// ---------------- ON-DEVICE PREDICTION (offline-first) ----------------
-// Evaluated in Chapter 6 across two independent datasets (this
-// project's water data and an external household power dataset used
-// as a cross-validation check): a 7-day moving average of REAL
-// recorded usage outperformed both linear and polynomial regression
-// on day-indexed daily data in every case tested, with polynomial
-// regression achieving negative R^2 throughout - meaning no genuine
-// day-indexed trend exists for it to fit. Moving average is
-// therefore used as the SOLE on-device forecasting method, for both
-// next-day usage prediction and leak detection. No trained model or
-// embedded regression coefficients are required on-device at all.
+
+
+
+
+
+
+
+
+
+
+
 #define USAGE_HISTORY_DAYS 7
 float dailyUsageHistory[USAGE_HISTORY_DAYS] = {0};
 int usageHistoryCount = 0;
 float litresAtDayStart = 0;
 unsigned long lastDayRollover = 0;
-const unsigned long DAY_MS = 86400000UL; // 24h - use a shorter value for demo/testing
+const unsigned long DAY_MS = 86400000UL;
 
-// Cold-start fallback: the general dataset average established during
-// offline validation (Chapter 5.3), used ONLY until at least one real
-// day of on-device usage history has been recorded. This is a
-// starting estimate, not a fitted model.
+
+
+
+
 const float COLD_START_FALLBACK_L = 651.0;
 
-Preferences prefs;       // stores Wi-Fi credentials
-Preferences calPrefs;    // stores tank calibration
-WebServer configServer(80);  // Wi-Fi setup portal
-WebServer calServer(81);     // tank calibration endpoints
+Preferences prefs;
+Preferences calPrefs;
+WebServer configServer(80);
+WebServer calServer(81);
 String savedSSID, savedPASS;
 
 void IRAM_ATTR pulseInISR()  { pulseIn_count++;  }
 void IRAM_ATTR pulseOutISR() { pulseOut_count++; }
 
-// Forward declaration (readDistance needs to exist before setupCalibrationEndpoints uses it)
+
 float readDistance(float tempC);
 
-// Starts an HTTPClient request against either an https:// (cloud) or
-// http:// (local backend) URL automatically, based on the URL itself.
-// This lets SERVER_URL be switched between the deployed Render URL
-// and a local FastAPI instance (e.g. during hardware debugging, to
-// remove cloud round-trip time as a variable) with no other code
-// changes needed anywhere else in the file.
+
+
+
+
+
+
 bool beginHttpAuto(HTTPClient &http, const String &url) {
-  if (url.startsWith("https://")) {
+  if (url.startsWith("https:
     static WiFiClientSecure secureClient;
     secureClient.setInsecure();
     return http.begin(secureClient, url);
   } else {
-    return http.begin(url); // plain HTTP for a local backend
+    return http.begin(url);
   }
 }
 
-// ============================================================
-//  ON-DEVICE PREDICTION (Stage 6 - fully offline forecasting)
-// ============================================================
-// Two methods are used for two DIFFERENT purposes, not as
-// interchangeable alternatives - this follows directly from the
-// evaluation in Chapter 5.4.1, where polynomial regression was
-// shown to outperform a moving-average baseline for forecasting
-// non-linear consumption. A flat moving average cannot capture the
-// curvature of human usage patterns, so it is not used as the
-// forecasting method here.
-//
-//   - Polynomial regression (embedded model coefficients): the
-//     PRIMARY forecasting method, used for tomorrow's predicted
-//     usage and time-to-empty. This is the method proven more
-//     accurate in evaluation, now migrated to run on-device.
-//
-//   - Moving average (on-device, real data): used ONLY for leak
-//     detection, where the requirement is simply "is today's usage
-//     abnormal relative to this household's recent average" - a
-//     task moving average is well suited to, unlike forecasting.
 
-// SOLE FORECASTING + LEAK-DETECTION METHOD: on-device moving average
-// of the device's own recorded daily usage. Falls back to the
-// general dataset average (COLD_START_FALLBACK_L) only until real
-// local history has accumulated.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 float movingAverageOfHistory() {
   if (usageHistoryCount == 0) return COLD_START_FALLBACK_L;
   float sum = 0;
@@ -256,9 +257,9 @@ float stdDevOfHistory(float mean) {
   return sqrt(sumSq / usageHistoryCount);
 }
 
-// Call once per "day" (or once per DAY_MS elapsed) to roll the
-// day's total usage into the on-device history window, used for
-// leak detection.
+
+
+
 void updateDailyUsageHistory(float totalLitresOutNow) {
   if (lastDayRollover == 0) {
     lastDayRollover = millis();
@@ -284,21 +285,21 @@ void updateDailyUsageHistory(float totalLitresOutNow) {
   lastDayRollover = millis();
 }
 
-// Combined output: forecast (polynomial) + depletion + leak flag
-// (moving average / std dev), computed entirely on-device.
-//
-// NOTE: this deliberately uses output parameters instead of returning
-// a custom struct. The Arduino IDE auto-generates function prototypes
-// and inserts them immediately after the #include lines, before any
-// struct defined later in the file - a struct RETURN TYPE therefore
-// triggers "does not name a type" even when the struct is correctly
-// defined earlier than the function in the source. Output parameters
-// avoid this entirely since only built-in types appear in the signature.
+
+
+
+
+
+
+
+
+
+
 void computeEdgePrediction(float levelPct, float todaySoFarLitres,
                             float &outPredictedLitres, float &outDaysRemaining,
                             bool &outAlert, bool &outLeakDetected, float &outLeakThreshold) {
-  // Forecast: on-device moving average (selected in Chapter 6 as the
-  // best-performing method across all datasets tested)
+
+
   outPredictedLitres = movingAverageOfHistory();
 
   float availableLitres = (levelPct / 100.0) * TANK_CAPACITY_L;
@@ -307,7 +308,7 @@ void computeEdgePrediction(float levelPct, float todaySoFarLitres,
                       : 999;
   outAlert = outDaysRemaining < 2.0;
 
-  // Leak detection: moving average + 2 std dev, using real device history
+
   if (usageHistoryCount >= 3) {
     float mean = movingAverageOfHistory();
     float std = stdDevOfHistory(mean);
@@ -315,20 +316,20 @@ void computeEdgePrediction(float levelPct, float todaySoFarLitres,
     outLeakDetected = todaySoFarLitres > outLeakThreshold;
   } else {
     outLeakThreshold = 0;
-    outLeakDetected = false; // not enough history yet to judge
+    outLeakDetected = false;
   }
 }
 
-// ============================================================
-//  CALIBRATION STORAGE
-// ============================================================
+
+
+
 bool emptyManuallyCalibrated = false;
 
-// Whether the automatic level-based fill logic is active. When false,
-// the pump ONLY responds to explicit manual commands from the app
-// (still subject to the safety gate and dry-run protection below,
-// which can never be disabled) - this is what genuinely lets a user
-// take manual control instead of the device auto-filling regardless.
+
+
+
+
+
 bool autoModeEnabled = true;
 
 void loadCalibration() {
@@ -354,9 +355,9 @@ void saveCalibration() {
   calPrefs.end();
 }
 
-// ============================================================
-//  SETUP
-// ============================================================
+
+
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -367,10 +368,10 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  // Boot in the OFF state. For an active-low relay this means
-  // releasing the pin to high-impedance INPUT (see pumpOff() below)
-  // so the relay board's own pull-up resistor drives a clean 5V
-  // HIGH, rather than the ESP32 trying to drive 3.3V itself.
+
+
+
+
   if (RELAY_ACTIVE_LOW) {
     pinMode(RELAY_PIN, INPUT);
   } else {
@@ -387,19 +388,19 @@ void setup() {
   analogSetPinAttenuation(PH_PIN,   ADC_11db);
 
   tempSensor.begin();
-  loadCalibration();          // load saved tank calibration (or defaults)
-  connectWiFi();               // app-driven Wi-Fi setup / reconnect
-  fetchDeviceConfig();          // sync capacity + sensor limits from cloud (advisory)
-  setupCalibrationEndpoints(); // start the tank calibration web server
+  loadCalibration();
+  connectWiFi();
+  fetchDeviceConfig();
+  setupCalibrationEndpoints();
 
   Serial.println("Sensors initialised. Starting readings...\n");
 }
 
-// ============================================================
-//  MAIN LOOP
-// ============================================================
+
+
+
 void loop() {
-  calServer.handleClient();   // MUST be called every loop or calibration won't respond
+  calServer.handleClient();
 
   tempSensor.requestTemperatures();
   float tempC = tempSensor.getTempCByIndex(0);
@@ -409,17 +410,17 @@ void loop() {
   float levelPct = 0;
   float availableLitres = 0;
   if (distance >= 0 && distance >= MIN_DISTANCE_CM && distance <= MAX_DISTANCE_CM) {
-    // Water height above the tank bottom, converted to a true frustum
-    // volume (see volumeAtHeightL() above) rather than a flat height
-    // percentage, since this container tapers from top to bottom.
+
+
+
     float waterHeightCm = EMPTY_DISTANCE_CM - distance;
     waterHeightCm = constrain(waterHeightCm, 0, TANK_HEIGHT_CM);
     availableLitres = volumeAtHeightL(waterHeightCm);
     levelPct = (TANK_CAPACITY_L > 0) ? (availableLitres / TANK_CAPACITY_L) * 100.0 : 0;
     levelPct = constrain(levelPct, 0, 100);
   } else if (distance >= 0) {
-    // Reading was received but falls outside the sensor's physical
-    // range - treat as unreliable rather than acting on it.
+
+
     Serial.printf("  [warning] distance %.1fcm outside sensor range [%.0f-%.0fcm] - ignoring this reading\n",
                   distance, MIN_DISTANCE_CM, MAX_DISTANCE_CM);
   }
@@ -441,14 +442,14 @@ void loop() {
     Serial.println("  [QUALITY] Level too low for reliable pH/turbidity reading - quality gate bypassed for initial fill.");
   }
 
-  // EDGE FAIL-SAFE PUMP LOGIC - runs locally, always
-  // The safety cut-off (unsafe water quality) is NEVER gated by auto
-  // mode - it always applies, manual or automatic, because it exists
-  // to protect the household regardless of who or what is driving
-  // the pump. Only the AUTOMATIC fill-on-low-level / stop-on-full
-  // behaviour is gated by autoModeEnabled - when auto mode is off,
-  // the pump instead does nothing here and waits for an explicit
-  // manual command via applyRemoteCommandIfValid() below.
+
+
+
+
+
+
+
+
   if (FORCE_PUMP_OFF) {
     pumpOff();
     dryRunFault = false;
@@ -462,20 +463,20 @@ void loop() {
     if (!dryRunFault) {
       pumpOn();
     } else if (millis() - dryRunFaultSince > DRY_RUN_RETRY_MS) {
-      // cooldown elapsed - try the source again, in case supply resumed
+
       Serial.println("  [SAFETY] Retrying pump after dry-run cooldown...");
       dryRunFault = false;
       pumpOn();
     }
   }
 
-  // DRY-RUN / MAINS-FAILURE PROTECTION
-  // Flow sensor pulses can be caused by air movement, not just water,
-  // so we check the more reliable signal instead: is the tank level
-  // actually rising while the pump has been running? If the pump has
-  // been on past the grace period and the level has not meaningfully
-  // increased, the source has likely failed (air, not water, is being
-  // pumped) - stop the pump to protect it.
+
+
+
+
+
+
+
   if (pumpStatus) {
     if (pumpOnSince == 0) {
       pumpOnSince = millis();
@@ -489,7 +490,7 @@ void loop() {
         dryRunFault = true;
         dryRunFaultSince = millis();
       } else {
-        // Level is genuinely rising - reset the window so we keep checking
+
         pumpOnSince = millis();
         levelAtPumpStart = levelPct;
       }
@@ -498,17 +499,17 @@ void loop() {
     pumpOnSince = 0;
   }
 
-  // Clear the fault once the tank has recovered on its own
+
   if (dryRunFault && levelPct >= PUMP_ON_LEVEL + 5.0) {
     dryRunFault = false;
     Serial.println("  [SAFETY] Dry-run fault cleared - level recovered.");
   }
 
-  // Continuously re-assert the relay pin every loop cycle (~1s) to
-  // match the current pumpStatus, using the same pinMode-switching
-  // approach as pumpOn()/pumpOff() (see notes there) rather than
-  // relying on the pin holding its value from whenever it was last
-  // explicitly set. This makes the output self-correcting every cycle.
+
+
+
+
+
   if (pumpStatus) {
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
@@ -519,7 +520,7 @@ void loop() {
     digitalWrite(RELAY_PIN, LOW);
   }
 
-  // ON-DEVICE PREDICTION - runs every cycle, no network needed
+
   updateDailyUsageHistory(totalLitresOut);
   float todaySoFar = totalLitresOut - litresAtDayStart;
   float predPredictedLitres, predDaysRemaining, predLeakThreshold;
@@ -560,9 +561,9 @@ void loop() {
   delay(1000);
 }
 
-// ============================================================
-//  SENSORS
-// ============================================================
+
+
+
 float readDistance(float tempC) {
   unsigned long waitStart = millis();
   while (digitalRead(ECHO_PIN) == HIGH) {
@@ -606,29 +607,29 @@ float readTurbidity() {
   long sum = 0;
   for (int i = 0; i < 20; i++) { sum += analogRead(TURB_PIN); delay(5); }
   float raw = sum / 20.0;
-  Serial.print("  [debug] Turbidity raw ADC: "); Serial.println(raw);  // ADD BACK
+  Serial.print("  [debug] Turbidity raw ADC: "); Serial.println(raw);
   float ntu = (TURB_CLEAR_RAW - raw) / (TURB_CLEAR_RAW - TURB_DIRTY_RAW) * TURB_MAX_NTU;
   return constrain(ntu, 0, TURB_MAX_NTU);
 }
 
-// ============================================================
-//  PUMP CONTROL
-// ============================================================
-// RELAY_ACTIVE_LOW is declared near the top of the file (setup() and
-// loop() both need it, and variables - unlike functions - are not
-// auto-forward-declared by Arduino).
 
-// NOTE: "off" is achieved by setting the pin to INPUT (high-impedance)
-// rather than actively driving it to 3.3V. The ESP32's 3.3V HIGH was
-// found to be insufficient to reliably de-energise this 5V relay
-// board (confirmed via testing: manual GND-jump and full power-
-// disconnect both switched cleanly, but the ESP32's own 3.3V HIGH did
-// not). These boards typically have their own onboard pull-up
-// resistor from IN to the 5V VCC rail, so releasing the pin to
-// high-impedance lets that pull-up provide a genuine, full 5V HIGH -
-// solving the voltage margin issue with no extra components needed.
-// "On" is unaffected by this issue, since driving a clean LOW/GND is
-// unambiguous regardless of logic voltage, so it is unchanged.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 void pumpOn()  {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
@@ -636,7 +637,7 @@ void pumpOn()  {
 }
 void pumpOff() {
   if (RELAY_ACTIVE_LOW) {
-    pinMode(RELAY_PIN, INPUT);  // release to high-impedance - board's own pull-up drives a clean 5V HIGH
+    pinMode(RELAY_PIN, INPUT);
   } else {
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, LOW);
@@ -644,15 +645,15 @@ void pumpOff() {
   pumpStatus = false;
 }
 
-// ============================================================
-//  DEVICE CONFIG SYNC (cloud is the single source of truth)
-// ============================================================
-// Fetches tank capacity and sensor physical limits from the cloud
-// backend. Called once at boot and again periodically. If the
-// device is offline, this simply fails silently and the existing
-// (hardcoded default, or last successfully fetched) values remain
-// in use - config sync is advisory only, never a hard dependency,
-// so the device stays fully operational without connectivity.
+
+
+
+
+
+
+
+
+
 void fetchDeviceConfig() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("  [CONFIG] Offline - using existing/default sensor limits.");
@@ -673,10 +674,10 @@ void fetchDeviceConfig() {
       if (val > 0) { TANK_CAPACITY_L = val; saveCalibration(); }
     }
 
-    // Only adopt the manufacturer-spec ESTIMATE if this device has
-    // never had a real, live empty-tank calibration performed. Once
-    // a real measurement exists, it always takes precedence over an
-    // average derived from standard tank dimensions.
+
+
+
+
     if (!emptyManuallyCalibrated) {
       int estIdx = resp.indexOf("\"estimated_empty_distance_cm\":");
       if (estIdx >= 0) {
@@ -709,9 +710,9 @@ void fetchDeviceConfig() {
   http.end();
 }
 
-// ============================================================
-//  TANK CALIBRATION ENDPOINTS (app talks to ESP32 on port 81)
-// ============================================================
+
+
+
 void setupCalibrationEndpoints() {
   calServer.on("/calibrate-empty", HTTP_POST, []() {
     tempSensor.requestTemperatures();
@@ -736,7 +737,7 @@ void setupCalibrationEndpoints() {
       return;
     }
     EMPTY_DISTANCE_CM = d;
-    emptyManuallyCalibrated = true; // real measurement now overrides any spec estimate
+    emptyManuallyCalibrated = true;
     saveCalibration();
     calServer.send(200, "application/json", "{\"empty_distance_cm\":" + String(d, 1) + "}");
   });
@@ -752,11 +753,11 @@ void setupCalibrationEndpoints() {
       return;
     }
     if (d < MIN_DISTANCE_CM) {
-      // This is the critical case from the tank spec chart: if the
-      // sensor is mounted too close to the maximum water level, the
-      // "Full" reading falls inside the sensor's blind zone and can
-      // never be measured reliably. Reject with a clear explanation
-      // rather than silently accepting an unreliable calibration.
+
+
+
+
+
       calServer.send(422, "application/json",
         "{\"error\":\"reading " + String(d, 1) + "cm is closer than the sensor's minimum range of " +
         String(MIN_DISTANCE_CM, 0) + "cm. The sensor needs to be mounted further above the maximum water level, or this tank/mounting combination cannot be reliably measured.\"}");
@@ -769,10 +770,10 @@ void setupCalibrationEndpoints() {
       return;
     }
     FULL_DISTANCE_CM = d;
-    // DEMO: recompute capacity from the true frustum geometry using
-    // the calibrated "full" water height, rather than trusting a
-    // manually typed capacity value. Only this line changed from the
-    // original endpoint logic.
+
+
+
+
     float fullWaterHeightCm = constrain(EMPTY_DISTANCE_CM - FULL_DISTANCE_CM, 0, TANK_HEIGHT_CM);
     TANK_CAPACITY_L = volumeAtHeightL(fullWaterHeightCm);
     saveCalibration();
@@ -828,9 +829,9 @@ void setupCalibrationEndpoints() {
   Serial.println("Tank calibration server started on port 81");
 }
 
-// ============================================================
-//  WIFI - App-driven credential setup (no hardcoded SSID/password)
-// ============================================================
+
+
+
 void loadWiFiCredentials() {
   prefs.begin("wifi", false);
   savedSSID = prefs.getString("ssid", "");
@@ -883,7 +884,7 @@ void startConfigMode() {
   Serial.println("     SmartWaterTank-Setup  (password: 12345678)");
   Serial.println("  2. Open the app's Device Setup screen");
   Serial.println("  3. Enter your home Wi-Fi name + password there");
-  Serial.print("  Device config address: http://");
+  Serial.print("  Device config address: http:
   Serial.println(WiFi.softAPIP());
   Serial.println("========================================");
 
@@ -903,7 +904,7 @@ void connectWiFi() {
 
   if (savedSSID == "") {
     Serial.println("No saved Wi-Fi - entering setup mode");
-    startConfigMode();  // blocks until configured + reboots, never returns
+    startConfigMode();
   }
 
   WiFi.mode(WIFI_STA);
@@ -919,23 +920,23 @@ void connectWiFi() {
     Serial.println(WiFi.localIP());
   } else {
     Serial.println("\nSaved Wi-Fi failed - entering setup mode");
-    startConfigMode();  // blocks until configured + reboots, never returns
+    startConfigMode();
   }
 }
 
 
 
-// ============================================================
-//  SPLIT-BRAIN RECONCILIATION
-// ============================================================
-// Called every SEND_INTERVAL instead of sendData() directly.
-// While connected: uploads live, and checks for any pending
-// manual pump command from the app (applying the "physical/
-// safety state wins" rule below).
-// While offline: buffers the reading locally instead of losing it.
-// On the transition back online: uploads everything captured
-// during the outage as one reconciliation batch, so the cloud
-// record reflects what actually happened, not just a gap.
+
+
+
+
+
+
+
+
+
+
+
 void handleConnectivityAndSync(float lvl, float flow, float total,
                                 float ph, float ntu, bool pump) {
   bool isOnline = (WiFi.status() == WL_CONNECTED);
@@ -950,10 +951,10 @@ void handleConnectivityAndSync(float lvl, float flow, float total,
     return;
   }
 
-  // We are online now.
+
   if (wasOffline) {
-    // Just reconnected - flush the buffer as a reconciliation batch
-    // BEFORE sending the live reading, so history stays in order.
+
+
     unsigned long downtimeMs = millis() - offlineSince;
     reconnectCount++;
     Serial.printf("  [RECONCILE] Connectivity restored after %.1f min offline. Syncing %d buffered readings (event #%lu)...\n",
@@ -962,25 +963,25 @@ void handleConnectivityAndSync(float lvl, float flow, float total,
     wasOffline = false;
   }
 
-  // Poll for a queued manual command FIRST, then apply it in the
-  // SAME cycle. Previously this was reversed (apply, then poll for
-  // next time) which meant a command polled at the end of one cycle
-  // was not applied until the start of the next sync cycle - roughly
-  // one SEND_INTERVAL later - making it appear stale almost every
-  // time under the original 5s staleness window. Polling and
-  // applying in the same cycle removes that lag entirely.
+
+
+
+
+
+
+
   pollForRemoteCommand();
   applyRemoteCommandIfValid();
   pollForAutoMode();
 
-  // Normal live upload
+
   sendData(lvl, flow, total, ph, ntu, pump);
 }
 
 void bufferReading(float lvl, float flow, float total, float ph, float ntu, bool pump) {
   if (offlineBufferCount >= OFFLINE_BUFFER_SIZE) {
-    // Buffer full - drop the oldest to make room (ring-buffer behaviour),
-    // since we prioritise recent history over very old outage data.
+
+
     for (int i = 1; i < OFFLINE_BUFFER_SIZE; i++) offlineBuffer[i - 1] = offlineBuffer[i];
     offlineBufferCount = OFFLINE_BUFFER_SIZE - 1;
   }
@@ -996,7 +997,7 @@ void syncOfflineBuffer(unsigned long downtimeMs) {
 
   HTTPClient http;
 
-  // Build the batch JSON: an array of readings plus reconciliation metadata
+
   String body = "{";
   body += "\"reconnect_event\":" + String(reconnectCount) + ",";
   body += "\"downtime_ms\":" + String(downtimeMs) + ",";
@@ -1023,19 +1024,19 @@ void syncOfflineBuffer(unsigned long downtimeMs) {
   Serial.print("  [RECONCILE] Batch sync HTTP "); Serial.println(code);
   http.end();
 
-  offlineBufferCount = 0; // clear buffer after attempting sync
+  offlineBufferCount = 0;
 }
 
-// ============================================================
-//  REMOTE PUMP OVERRIDE - "physical state wins" reconciliation
-// ============================================================
-// The app MAY request a manual pump override via the cloud, but this
-// is deliberately advisory only. Local edge safety logic can and will
-// override it: a stale command (>5s old by the time it is received)
-// or a command that conflicts with an active safety fault (unsafe
-// water quality or a dry-run fault) is rejected outright. This
-// prevents a delayed or corrupted network command from ever pushing
-// the pump into an unsafe physical state.
+
+
+
+
+
+
+
+
+
+
 void pollForRemoteCommand() {
   HTTPClient http;
   String cmdUrl = String(SERVER_URL);
@@ -1044,11 +1045,11 @@ void pollForRemoteCommand() {
   int code = http.GET();
   if (code == 200) {
     String resp = http.getString();
-    // Expected: {"has_command": true, "pump_on": true, "issued_at_ms": 123456}
+
     if (resp.indexOf("\"has_command\":true") >= 0) {
       remoteCommandValue = (resp.indexOf("\"pump_on\":true") >= 0);
       remoteCommandPending = true;
-      remoteCommandTimestamp = millis(); // local receipt time, used for staleness check
+      remoteCommandTimestamp = millis();
       Serial.print("  [RECONCILE] Remote pump command received: ");
       Serial.println(remoteCommandValue ? "ON" : "OFF");
     }
@@ -1056,10 +1057,10 @@ void pollForRemoteCommand() {
   http.end();
 }
 
-// Polls the cloud for the current auto-mode setting, as set by the
-// app's Auto Mode toggle. Applied immediately - unlike the manual
-// pump command, this is a persistent mode setting rather than a
-// one-off action, so no staleness rejection applies to it.
+
+
+
+
 void pollForAutoMode() {
   HTTPClient http;
   String url = String(SERVER_URL);
@@ -1089,7 +1090,7 @@ void applyRemoteCommandIfValid() {
   }
 
   bool tooStale = (millis() - remoteCommandTimestamp) > REMOTE_COMMAND_MAX_AGE_MS;
-  bool safetyBlocked = dryRunFault; // extend with other fault flags as needed
+  bool safetyBlocked = dryRunFault;
 
   if (tooStale) {
     Serial.println("  [RECONCILE] Remote command rejected - stale (>5s), local state unchanged.");
@@ -1104,9 +1105,9 @@ void applyRemoteCommandIfValid() {
   remoteCommandPending = false;
 }
 
-// ============================================================
-//  UPLOAD TO SERVER / CLOUD
-// ============================================================
+
+
+
 void sendData(float lvl, float flow, float total,
               float ph, float ntu, bool pump) {
   if (WiFi.status() != WL_CONNECTED) {
